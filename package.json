@@ -4,6 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "node index.js",
+    "bot": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -12,6 +14,8 @@
   "type": "commonjs",
   "dependencies": {
     "@nadohq/client": "^0.1.0-alpha.50",
-    "dotenv": "^17.3.1"
+    "dotenv": "^17.3.1",
+    "viem": "^2.21.0",
+    "ws": "^8.18.0"
   }
 }
