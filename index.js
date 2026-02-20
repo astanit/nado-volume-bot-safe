@@ -1,7 +1,7 @@
 /**
- * Nado Volume Bot — @nadohq/client
- * Баланс через client.subaccount.getSubaccountSummary
- * Ожидание депозита, если баланс < 30 USDC0.
+ * Nado Volume Bot — docs.nado.xyz 2026
+ * getNadoClient({ privateKey, chain }) — обёртка над createNadoClient
+ * SDK не имеет client.subscribe / client.on('orderbook') — используем polling getLatestMarketPrices
  */
 require('dotenv').config();
 const { createPublicClient, createWalletClient, http } = require('viem');
@@ -13,16 +13,32 @@ const {
   QUOTE_PRODUCT_ID,
 } = require('@nadohq/client');
 
+function getNadoClient({ privateKey, chain }) {
+  const chainEnv = chain || 'inkMainnet';
+  const pk =
+    typeof privateKey === 'string' && !privateKey.startsWith('0x')
+      ? `0x${privateKey}`
+      : privateKey;
+  const account = privateKeyToAccount(pk);
+  const chainConfig = CHAIN_ENV_TO_CHAIN[chainEnv];
+  const publicClient = createPublicClient({ chain: chainConfig, transport: http() });
+  const walletClient = createWalletClient({
+    account,
+    chain: chainConfig,
+    transport: http(),
+  });
+  return createNadoClient(chainEnv, { publicClient, walletClient });
+}
+
 // --- Конфиг ---
-const CHAIN_ENV = 'inkMainnet';
 const PRODUCT_IDS = [1, 2]; // BTC-perp, ETH-perp
-const SPREAD_PCT = 0.00015; // 0.015%
-const ORDER_SIZE = String(process.env.ORDER_SIZE || 15);
+const SPREAD_PCT = 0.00015;
+const ORDER_SIZE = '15';
 const MIN_BALANCE_USDC = 30;
 const TICK_MS = 200;
 const LOG_INTERVAL_MS = 60 * 1000;
 const VOLUME_WINDOW_MS = 5 * 60 * 1000;
-const WAIT_LOG_MS = 10 * 1000; // "Жду баланса..." каждые 10 сек
+const WAIT_LOG_MS = 10 * 1000;
 
 function log(msg) {
   const ts = new Date().toISOString();
@@ -37,39 +53,35 @@ function toNum(v) {
 }
 
 function runBot() {
-  const rawKey = process.env.PRIVATE_KEY;
-  if (!rawKey) {
+  const privateKey = process.env.PRIVATE_KEY;
+  if (!privateKey) {
     log('ERROR: PRIVATE_KEY не задан');
     process.exit(1);
   }
-  const privateKey =
-    typeof rawKey === 'string' && !rawKey.startsWith('0x') ? `0x${rawKey}` : rawKey;
 
-  const chain = CHAIN_ENV_TO_CHAIN[CHAIN_ENV];
-  const publicClient = createPublicClient({ chain, transport: http() });
-  const account = privateKeyToAccount(privateKey);
-  const walletClient = createWalletClient({
-    account,
-    chain,
-    transport: http(),
+  const nadoClient = getNadoClient({
+    privateKey,
+    chain: 'inkMainnet',
   });
 
-  const client = createNadoClient(CHAIN_ENV, {
-    publicClient,
-    walletClient,
-  });
+  const account = privateKeyToAccount(
+    typeof privateKey === 'string' && !privateKey.startsWith('0x')
+      ? `0x${privateKey}`
+      : privateKey
+  );
+  const subaccountOwner = account.address;
+  const subaccountName = 'default';
 
   const defaultAppendix = String(packOrderAppendix({ orderExecutionType: 'default' }));
-  const subaccountName = process.env.SUBACCOUNT_NAME || '';
 
   const lastBidAsk = new Map();
   let volumeQuoteLast5Min = 0;
   let lastVolumeResetTime = Date.now();
-  let tickInterval = null;
-  let logInterval = null;
   let balanceUsdc = 0;
   let hasStarted = false;
+  let tickInterval = null;
   let waitLogInterval = null;
+  let reconnectTimeout = null;
 
   function getExpirationSec() {
     return Math.floor(Date.now() / 1000) + 86400;
@@ -77,22 +89,33 @@ function runBot() {
 
   async function getBalanceUsdc() {
     try {
-      const summary = await client.subaccount.getSubaccountSummary({
-        subaccountOwner: account.address,
+      const summary = await nadoClient.subaccount.getSubaccountSummary({
+        subaccountOwner,
         subaccountName,
       });
       if (!summary || !summary.balances) return 0;
       const quoteBal = summary.balances.find((b) => b.productId === QUOTE_PRODUCT_ID);
       if (!quoteBal) return 0;
       return toNum(quoteBal.amount);
-    } catch (_) {
+    } catch (err) {
+      log(`ERROR getSubaccountSummary: ${err && err.message ? err.message : err}`);
+      scheduleReconnect();
       return 0;
     }
   }
 
+  function scheduleReconnect() {
+    if (reconnectTimeout) return;
+    log('Reconnect через 5 сек…');
+    reconnectTimeout = setTimeout(() => {
+      reconnectTimeout = null;
+      runTick().catch(() => {});
+    }, 5000);
+  }
+
   async function fetchPrices() {
     try {
-      const { marketPrices } = await client.market.getLatestMarketPrices({
+      const { marketPrices } = await nadoClient.market.getLatestMarketPrices({
         productIds: PRODUCT_IDS,
       });
       for (const mp of marketPrices) {
@@ -102,13 +125,10 @@ function runBot() {
           lastBidAsk.set(mp.productId, { bid, ask, mid: (bid + ask) / 2 });
         }
       }
-    } catch (_) {}
-  }
-
-  function ignore2024(err) {
-    if (err && (String(err.code) === '2024' || String(err.message || '').includes('2024')))
-      return;
-    log(`ERROR: ${err && err.message ? err.message : err}`);
+    } catch (err) {
+      log(`ERROR getLatestMarketPrices: ${err && err.message ? err.message : err}`);
+      scheduleReconnect();
+    }
   }
 
   async function runTick() {
@@ -123,9 +143,11 @@ function runBot() {
     const exp = String(getExpirationSec());
 
     try {
-      await client.market.cancelProductOrders({ productIds: PRODUCT_IDS });
+      await nadoClient.market.cancelProductOrders({ productIds: PRODUCT_IDS });
     } catch (err) {
-      ignore2024(err);
+      if (String(err?.code) !== '2024' && !String(err?.message || '').includes('2024')) {
+        log(`ERROR cancelProductOrders: ${err && err.message ? err.message : err}`);
+      }
       return;
     }
 
@@ -135,7 +157,7 @@ function runBot() {
       const buyPrice = Math.floor(book.mid * (1 - SPREAD_PCT) * 1e6) / 1e6;
       const sellPrice = Math.ceil(book.mid * (1 + SPREAD_PCT) * 1e6) / 1e6;
       try {
-        await client.market.placeOrder({
+        await nadoClient.market.placeOrder({
           productId,
           order: {
             price: String(buyPrice),
@@ -145,10 +167,12 @@ function runBot() {
           },
         });
       } catch (err) {
-        ignore2024(err);
+        if (String(err?.code) !== '2024' && !String(err?.message || '').includes('2024')) {
+          log(`ERROR place buy ${productId}: ${err && err.message ? err.message : err}`);
+        }
       }
       try {
-        await client.market.placeOrder({
+        await nadoClient.market.placeOrder({
           productId,
           order: {
             price: String(sellPrice),
@@ -158,21 +182,21 @@ function runBot() {
           },
         });
       } catch (err) {
-        ignore2024(err);
+        if (String(err?.code) !== '2024' && !String(err?.message || '').includes('2024')) {
+          log(`ERROR place sell ${productId}: ${err && err.message ? err.message : err}`);
+        }
       }
     }
   }
 
-  function scheduleTick() {
+  function startTickLoop() {
     if (tickInterval) clearInterval(tickInterval);
     tickInterval = setInterval(() => runTick().catch(() => {}), TICK_MS);
   }
 
   function startWaitLoop() {
     if (waitLogInterval) clearInterval(waitLogInterval);
-    waitLogInterval = setInterval(() => {
-      log('Жду баланса после депозита...');
-    }, WAIT_LOG_MS);
+    waitLogInterval = setInterval(() => log('Жду баланса...'), WAIT_LOG_MS);
   }
 
   function stopWaitLoop() {
@@ -189,21 +213,18 @@ function runBot() {
         stopWaitLoop();
         if (!hasStarted) {
           hasStarted = true;
-          log(`Баланс ${balanceUsdc.toFixed(2)} USDC0 — запуск цикла`);
+          log(`Баланс ${balanceUsdc.toFixed(2)} USDC0 — запуск маркетмейкинга`);
           await fetchPrices();
-          scheduleTick();
+          startTickLoop();
         }
       } else {
-        if (!hasStarted) {
-          startWaitLoop();
-        }
+        if (!hasStarted) startWaitLoop();
       }
       await new Promise((r) => setTimeout(r, 5000));
     }
   }
 
-  if (logInterval) clearInterval(logInterval);
-  logInterval = setInterval(async () => {
+  setInterval(async () => {
     balanceUsdc = await getBalanceUsdc();
     const now = Date.now();
     if (now - lastVolumeResetTime >= VOLUME_WINDOW_MS) {
@@ -227,17 +248,17 @@ function runBot() {
     setTimeout(() => balanceCheckLoop().catch(() => {}), 5000);
   });
 
-  log(`Nado volume bot запущен. Chain: ${CHAIN_ENV}, ORDER_SIZE: ${ORDER_SIZE}, мин. баланс: ${MIN_BALANCE_USDC} USDC0`);
+  log('Nado volume bot запущен. chain: inkMainnet, ORDER_SIZE: 15, products: 1, 2');
 }
 
 try {
   runBot();
 } catch (e) {
-  log(`ERROR: ${e && e.message ? e.message : e}`);
+  console.error('ERROR:', e && e.message ? e.message : e);
 }
 process.on('uncaughtException', (err) => {
   log(`FATAL: ${err && err.message ? err.message : err}`);
 });
 process.on('unhandledRejection', (reason) => {
-  log(`FATAL: unhandledRejection ${reason}`);
+  log(`FATAL unhandledRejection: ${reason}`);
 });
