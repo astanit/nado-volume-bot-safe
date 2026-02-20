@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { createPublicClient, createWalletClient, http } = require('viem');
+const { createPublicClient, createWalletClient, http, parseUnits, formatUnits } = require('viem');
 const { privateKeyToAccount } = require('viem/accounts');
 const {
   createNadoClient,
@@ -9,11 +9,19 @@ const {
 
 /* ═══════════ CONFIG ═══════════ */
 
-const PRODUCT_IDS = [1, 2];
-const SPREAD_PCT  = 0.00015;
-const ORDER_SIZE  = '15';
-const TICK_MS     = 200;
-const LOG_INTERVAL = 60_000;
+const PRODUCT_IDS   = [1, 2];
+const SPREAD_PCT    = 0.00015;
+const ORDER_SIZE    = '15';
+
+// ██ ГЛАВНОЕ ИЗМЕНЕНИЕ: было 200мс → стало 5 сек
+// 200мс = 30 запросов/сек → Cloudflare банит моментально
+const TICK_MS       = 5000;
+
+// Если 429 — увеличиваем паузу
+const MAX_TICK_MS   = 60000;
+const BACKOFF_MULT  = 2;
+
+const LOG_INTERVAL  = 60_000;
 
 /* ═══════════ HELPERS ═══════════ */
 
@@ -23,16 +31,27 @@ function log(msg) {
 
 function err(tag, e) {
   const text = e?.shortMessage || e?.message || String(e);
-  console.error(`[${new Date().toISOString()}] ❌ ${tag}: ${text}`);
-  // если есть детали от SDK — тоже покажем
-  if (e?.details) console.error(`   details: ${e.details}`);
-  if (e?.cause)   console.error(`   cause:   ${e.cause?.message || e.cause}`);
+  // Обрезаем HTML от Cloudflare
+  const clean = text.includes('<!DOCTYPE') 
+    ? text.slice(0, text.indexOf('<!DOCTYPE')) + '[Cloudflare HTML blocked]'
+    : text;
+  console.error(`[${new Date().toISOString()}] ❌ ${tag}: ${clean.slice(0, 300)}`);
 }
 
 function toNum(v) {
   if (v == null) return 0;
+  if (typeof v === 'bigint') return Number(v);
   if (typeof v === 'object' && typeof v.toNumber === 'function') return v.toNumber();
   return Number(v);
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function is429(e) {
+  const msg = e?.message || '';
+  return msg.includes('429') || msg.includes('Too Many Requests') || msg.includes('cf_chl');
 }
 
 /* ═══════════ CLIENT ═══════════ */
@@ -57,112 +76,111 @@ function getNadoClient(privateKey) {
 
   log(`Wallet: ${account.address}`);
 
-  // Дампим все доступные namespace и методы SDK — один раз при старте
-  const namespaces = Object.keys(client).filter(
-    (k) => typeof client[k] === 'object' && client[k] !== null
-  );
-  for (const ns of namespaces) {
+  // Показываем все доступные методы SDK
+  for (const ns of Object.keys(client)) {
+    if (typeof client[ns] !== 'object' || client[ns] === null) continue;
     const methods = Object.keys(client[ns]).filter(
       (m) => typeof client[ns][m] === 'function'
     );
-    if (methods.length > 0) {
-      log(`SDK namespace "${ns}": [${methods.join(', ')}]`);
+    if (methods.length) {
+      log(`  SDK "${ns}": [${methods.join(', ')}]`);
     }
   }
 
-  return { client, address: account.address };
+  return { client, account, publicClient, walletClient };
 }
 
-/* ═══════════ BALANCE ═══════════ */
+/* ═══════════ DEPOSIT ═══════════ */
 
-async function discoverAndCheckBalance(client, address) {
-  log('── Проверяю баланс ──');
+async function ensureDeposit(client, address) {
+  log('── Проверяю депозит на Nado ──');
 
-  // Собираем все «похожие» методы из всех namespace
-  const candidates = [];
-
+  // 1) Ищем метод для проверки/создания депозита
+  const allMethods = {};
   for (const ns of Object.keys(client)) {
     if (typeof client[ns] !== 'object' || client[ns] === null) continue;
-    for (const method of Object.keys(client[ns])) {
-      if (typeof client[ns][method] !== 'function') continue;
-      if (/balance|account|portfolio|collateral|info|margin|equity/i.test(method)) {
-        candidates.push({ ns, method });
+    for (const m of Object.keys(client[ns])) {
+      if (typeof client[ns][m] === 'function') {
+        allMethods[`${ns}.${m}`] = client[ns][m].bind(client[ns]);
       }
     }
   }
 
-  log(`Кандидаты для баланса: ${candidates.map(c => `${c.ns}.${c.method}`).join(', ') || 'НЕТ'}`);
+  // 2) Пробуем найти баланс/аккаунт
+  const balanceKeys = Object.keys(allMethods).filter((k) =>
+    /balance|deposit|account|portfolio|collateral|margin|info/i.test(k)
+  );
 
-  for (const { ns, method } of candidates) {
+  log(`  Методы баланса/депозита: [${balanceKeys.join(', ') || 'НЕТ'}]`);
+
+  for (const key of balanceKeys) {
     try {
-      const res = await client[ns][method]({ address });
+      await sleep(500); // пауза между вызовами!
+      const res = await allMethods[key]({ address });
       const dump = JSON.stringify(res, (_, v) =>
         typeof v === 'bigint' ? v.toString() : v
       ).slice(0, 500);
-      log(`  ${ns}.${method}() → ${dump}`);
-
-      // Пытаемся вытащить число
-      const val = toNum(
-        res?.balance ?? res?.collateral ?? res?.equity ?? res?.availableBalance ?? res
-      );
-      if (Number.isFinite(val) && val > 0) {
-        log(`✅ Баланс найден: ${val}`);
-        return val;
-      }
+      log(`  ${key}() → ${dump}`);
     } catch (e) {
-      err(`${ns}.${method}`, e);
+      err(`  ${key}`, e);
     }
   }
 
-  log('⚠️  Баланс не найден автоматически. Пробуем работать — ошибки покажут причину.');
-  return null;
+  // 3) Пробуем deposit, если есть такой метод
+  const depositKey = Object.keys(allMethods).find((k) =>
+    /^(account|vault|deposit)\.deposit$/i.test(k) || k === 'deposit.deposit'
+  );
+
+  if (depositKey) {
+    log(`  Найден метод депозита: ${depositKey}`);
+    log(`  ⚠️  Автодепозит отключён — сделайте вручную через app.nado.fi`);
+  }
+
+  return true;
 }
 
 /* ═══════════ BOT ═══════════ */
 
 async function runBot() {
-  /* ── env check ── */
   const privateKey = process.env.PRIVATE_KEY;
   if (!privateKey) {
-    log('⛔ PRIVATE_KEY не задан!');
-    log('   Railway → Settings → Variables → добавьте PRIVATE_KEY');
+    log('⛔ PRIVATE_KEY не задан → Railway → Variables');
     process.exit(1);
   }
-  log(`PRIVATE_KEY загружен (${privateKey.length} символов)`);
 
-  /* ── client ── */
-  const { client, address } = getNadoClient(privateKey);
+  const { client, account } = getNadoClient(privateKey);
+  const address = account.address;
 
   const defaultAppendix = String(
     packOrderAppendix({ orderExecutionType: 'default' })
   );
 
-  /* ── balance ── */
-  const balance = await discoverAndCheckBalance(client, address);
-
-  if (balance !== null && balance <= 0) {
-    log('⛔ Нулевой баланс. Пополните депозит в app.nado.fi');
-    process.exit(1);
-  }
+  /* ── deposit check ── */
+  await ensureDeposit(client, address);
 
   /* ── state ── */
   const lastBidAsk = new Map();
   let tickCount = 0;
-  let orderOk = 0;
+  let orderOk   = 0;
   let orderFail = 0;
+  let currentTickMs = TICK_MS;   // адаптивный интервал
+  let consecutive429 = 0;
 
-  /* ── prices ── */
+  /* ── fetch prices (с защитой от 429) ── */
   async function fetchPrices() {
     try {
       const result = await client.market.getLatestMarketPrices({
         productIds: PRODUCT_IDS,
       });
 
+      consecutive429 = 0; // сброс при успехе
+      currentTickMs = TICK_MS;
+
       const prices = result?.marketPrices ?? result?.prices ?? [];
 
       if (!Array.isArray(prices) || prices.length === 0) {
-        log(`⚠️  getLatestMarketPrices вернул пустое: ${JSON.stringify(result).slice(0, 300)}`);
-        return;
+        log(`⚠️ Пустой ответ цен: ${JSON.stringify(result).slice(0, 200)}`);
+        return false;
       }
 
       for (const mp of prices) {
@@ -172,15 +190,27 @@ async function runBot() {
           lastBidAsk.set(mp.productId, { bid, ask, mid: (bid + ask) / 2 });
         }
       }
+      return true;
     } catch (e) {
-      err('fetchPrices', e);
+      if (is429(e)) {
+        consecutive429++;
+        currentTickMs = Math.min(currentTickMs * BACKOFF_MULT, MAX_TICK_MS);
+        log(`⚠️ 429 Rate Limit (#${consecutive429}). Пауза → ${currentTickMs / 1000}с`);
+      } else {
+        err('fetchPrices', e);
+      }
+      return false;
     }
   }
 
   /* ── tick ── */
   async function runTick() {
     tickCount++;
-    await fetchPrices();
+
+    const gotPrices = await fetchPrices();
+    if (!gotPrices) return; // не шлём ордера если цен нет
+
+    await sleep(300); // пауза между вызовами API
 
     const exp = String(Math.floor(Date.now() / 1000) + 86400);
 
@@ -188,96 +218,127 @@ async function runBot() {
     try {
       await client.market.cancelProductOrders({ productIds: PRODUCT_IDS });
     } catch (e) {
-      // Может быть нормой, если ордеров нет
-      if (tickCount <= 3) err('cancelOrders', e);
+      if (is429(e)) {
+        currentTickMs = Math.min(currentTickMs * BACKOFF_MULT, MAX_TICK_MS);
+        log(`⚠️ 429 на cancel. Пауза → ${currentTickMs / 1000}с`);
+        return;
+      }
+      if (tickCount <= 5) err('cancelOrders', e);
     }
 
     for (const productId of PRODUCT_IDS) {
       const book = lastBidAsk.get(productId);
-      if (!book || !Number.isFinite(book.mid) || book.mid <= 0) {
-        if (tickCount <= 5) log(`⚠️  pid=${productId}: нет цены`);
-        continue;
-      }
+      if (!book || !Number.isFinite(book.mid) || book.mid <= 0) continue;
 
       const buyPrice  = (Math.floor(book.mid * (1 - SPREAD_PCT) * 1e6) / 1e6).toFixed(6);
       const sellPrice = (Math.ceil(book.mid * (1 + SPREAD_PCT) * 1e6) / 1e6).toFixed(6);
+
+      await sleep(200); // пауза между ордерами
 
       // BUY
       try {
         const res = await client.market.placeOrder({
           productId,
           order: {
-            price:      buyPrice,
-            amount:     ORDER_SIZE,
+            price: buyPrice,
+            amount: ORDER_SIZE,
             expiration: exp,
-            appendix:   defaultAppendix,
+            appendix: defaultAppendix,
           },
         });
         orderOk++;
-        if (tickCount <= 5) {
-          log(`✅ BUY  pid=${productId} @ ${buyPrice} → ${JSON.stringify(res).slice(0, 150)}`);
+        if (tickCount <= 10 || tickCount % 50 === 0) {
+          log(`✅ BUY  pid=${productId} @ ${buyPrice}`);
         }
       } catch (e) {
         orderFail++;
-        if (orderFail <= 10 || orderFail % 100 === 0) {
-          err(`BUY pid=${productId} @ ${buyPrice}`, e);
+        if (is429(e)) {
+          currentTickMs = Math.min(currentTickMs * BACKOFF_MULT, MAX_TICK_MS);
+          log(`⚠️ 429 на BUY. Пауза → ${currentTickMs / 1000}с`);
+          return;
+        }
+        // Логируем первые 20 ошибок + каждую 50-ю
+        if (orderFail <= 20 || orderFail % 50 === 0) {
+          err(`BUY pid=${productId}`, e);
         }
       }
+
+      await sleep(200);
 
       // SELL
       try {
         const res = await client.market.placeOrder({
           productId,
           order: {
-            price:      sellPrice,
-            amount:     String(-Number(ORDER_SIZE)),
+            price: sellPrice,
+            amount: String(-Number(ORDER_SIZE)),
             expiration: exp,
-            appendix:   defaultAppendix,
+            appendix: defaultAppendix,
           },
         });
         orderOk++;
-        if (tickCount <= 5) {
-          log(`✅ SELL pid=${productId} @ ${sellPrice} → ${JSON.stringify(res).slice(0, 150)}`);
+        if (tickCount <= 10 || tickCount % 50 === 0) {
+          log(`✅ SELL pid=${productId} @ ${sellPrice}`);
         }
       } catch (e) {
         orderFail++;
-        if (orderFail <= 10 || orderFail % 100 === 0) {
-          err(`SELL pid=${productId} @ ${sellPrice}`, e);
+        if (is429(e)) {
+          currentTickMs = Math.min(currentTickMs * BACKOFF_MULT, MAX_TICK_MS);
+          log(`⚠️ 429 на SELL. Пауза → ${currentTickMs / 1000}с`);
+          return;
+        }
+        if (orderFail <= 20 || orderFail % 50 === 0) {
+          err(`SELL pid=${productId}`, e);
         }
       }
     }
   }
 
-  /* ── start ── */
-
-  log('🚀 Первый fetch цен…');
-  await fetchPrices();
-
-  if (lastBidAsk.size === 0) {
-    log('⚠️  Цены пустые. Проверьте PRODUCT_IDS и доступность Nado API.');
-    log('   Продолжаю — может появиться позже.');
-  } else {
-    for (const [pid, v] of lastBidAsk) {
-      log(`   pid=${pid}: bid=${v.bid} ask=${v.ask} mid=${v.mid.toFixed(2)}`);
+  /* ── adaptive loop (вместо setInterval) ── */
+  async function loop() {
+    while (true) {
+      try {
+        await runTick();
+      } catch (e) {
+        err('runTick', e);
+      }
+      await sleep(currentTickMs);
     }
   }
 
-  log(`🔄 Запускаю тики каждые ${TICK_MS} мс`);
+  /* ── start ── */
+  log('');
+  log('╔══════════════════════════════════════════════╗');
+  log('║  Nado Market Maker Bot                       ║');
+  log('╠══════════════════════════════════════════════╣');
+  log(`║  Tick interval: ${TICK_MS / 1000}s (adaptive up to ${MAX_TICK_MS / 1000}s)    ║`);
+  log(`║  Products: ${PRODUCT_IDS.join(', ')}                           ║`);
+  log(`║  Order size: ${ORDER_SIZE}                            ║`);
+  log(`║  Spread: ${(SPREAD_PCT * 100).toFixed(3)}%                          ║`);
+  log('╚══════════════════════════════════════════════╝');
+  log('');
 
-  setInterval(() => {
-    runTick().catch((e) => err('runTick', e));
-  }, TICK_MS);
+  // Первый fetch
+  const ok = await fetchPrices();
+  if (ok) {
+    for (const [pid, v] of lastBidAsk) {
+      log(`  pid=${pid}: bid=${v.bid} ask=${v.ask} mid=${v.mid.toFixed(2)}`);
+    }
+  } else {
+    log('⚠️ Первый fetch не удался — бот продолжит пробовать');
+  }
 
   // Мониторинг
   setInterval(() => {
     const mids = Array.from(lastBidAsk.entries())
       .map(([pid, v]) => `pid${pid}=${v.mid.toFixed(2)}`)
       .join(' | ');
-    log(`📊 ${mids || 'нет цен'} | ticks=${tickCount} ok=${orderOk} fail=${orderFail}`);
+    log(`📊 ${mids || '—'} | tick=${currentTickMs / 1000}s | ticks=${tickCount} ok=${orderOk} fail=${orderFail}`);
   }, LOG_INTERVAL);
-}
 
-/* ═══════════ ENTRY ═══════════ */
+  // Основной цикл
+  loop();
+}
 
 runBot().catch((e) => {
   console.error('FATAL:', e);
