@@ -7,13 +7,26 @@ const {
   packOrderAppendix,
 } = require('@nadohq/client');
 
-/* ───────── helpers ───────── */
+/* ═══════════ CONFIG ═══════════ */
 
-function log(msg)  { console.log(`[${new Date().toISOString()}] ${msg}`); }
-function logErr(tag, e) {
-  // ← ВСЕГДА логируем ошибки
-  const text = e?.shortMessage || e?.message || JSON.stringify(e);
+const PRODUCT_IDS = [1, 2];
+const SPREAD_PCT  = 0.00015;
+const ORDER_SIZE  = '15';
+const TICK_MS     = 200;
+const LOG_INTERVAL = 60_000;
+
+/* ═══════════ HELPERS ═══════════ */
+
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+function err(tag, e) {
+  const text = e?.shortMessage || e?.message || String(e);
   console.error(`[${new Date().toISOString()}] ❌ ${tag}: ${text}`);
+  // если есть детали от SDK — тоже покажем
+  if (e?.details) console.error(`   details: ${e.details}`);
+  if (e?.cause)   console.error(`   cause:   ${e.cause?.message || e.cause}`);
 }
 
 function toNum(v) {
@@ -22,239 +35,249 @@ function toNum(v) {
   return Number(v);
 }
 
-/* ───────── client ───────── */
+/* ═══════════ CLIENT ═══════════ */
 
-function getNadoClient({ privateKey }) {
-  const pk =
-    typeof privateKey === 'string' && !privateKey.startsWith('0x')
-      ? `0x${privateKey}`
-      : privateKey;
-
-  const account     = privateKeyToAccount(pk);
+function getNadoClient(privateKey) {
+  const pk = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
+  const account = privateKeyToAccount(pk);
   const chainConfig = CHAIN_ENV_TO_CHAIN.inkMainnet;
 
   const publicClient = createPublicClient({
     chain: chainConfig,
     transport: http(),
   });
+
   const walletClient = createWalletClient({
     account,
     chain: chainConfig,
     transport: http(),
   });
 
-  return createNadoClient('inkMainnet', { publicClient, walletClient });
-}
+  const client = createNadoClient('inkMainnet', { publicClient, walletClient });
 
-/* ───────── config ───────── */
+  log(`Wallet: ${account.address}`);
 
-const PRODUCT_IDS  = [1, 2];
-const SPREAD_PCT   = 0.00015;
-const ORDER_SIZE   = '15';
-const TICK_MS      = 200;
-const MIN_BALANCE  = 1;          // минимальный баланс (USDC и т.п.)
-
-/* ───────── bot ───────── */
-
-async function runBot() {
-  const privateKey = process.env.PRIVATE_KEY;
-  if (!privateKey) return log('ERROR: PRIVATE_KEY не задан');
-
-  const nadoClient = getNadoClient({ privateKey });
-  const address    = nadoClient.context.walletClient?.account?.address;
-  if (!address) return log('ERROR: не удалось получить адрес кошелька');
-
-  log(`Кошелёк: ${address}`);
-
-  const defaultAppendix = String(
-    packOrderAppendix({ orderExecutionType: 'default' }),
+  // Дампим все доступные namespace и методы SDK — один раз при старте
+  const namespaces = Object.keys(client).filter(
+    (k) => typeof client[k] === 'object' && client[k] !== null
   );
-  const lastBidAsk = new Map();
-
-  /* ── 1. ПРОВЕРКА БАЛАНСА ── */
-
-  async function checkBalance() {
-    try {
-      // Пробуем несколько вариантов API (зависит от версии SDK)
-      let balance = null;
-
-      // Вариант A — getAccountInfo / getBalance
-      if (typeof nadoClient.account?.getAccountInfo === 'function') {
-        const info = await nadoClient.account.getAccountInfo({ address });
-        balance = toNum(info?.balance ?? info?.collateral ?? info?.equity);
-        log(`[getAccountInfo] Баланс: ${balance}`);
-      }
-      // Вариант B — getPortfolio
-      else if (typeof nadoClient.account?.getPortfolio === 'function') {
-        const portfolio = await nadoClient.account.getPortfolio({ address });
-        balance = toNum(portfolio?.balance ?? portfolio?.collateral);
-        log(`[getPortfolio] Баланс: ${balance}`);
-      }
-      // Вариант C — getBalance
-      else if (typeof nadoClient.account?.getBalance === 'function') {
-        const res = await nadoClient.account.getBalance({ address });
-        balance = toNum(res?.balance ?? res);
-        log(`[getBalance] Баланс: ${balance}`);
-      }
-      // Вариант D — перебираем все доступные методы account.*
-      else {
-        const methods = nadoClient.account
-          ? Object.keys(nadoClient.account)
-          : [];
-        log(`⚠️  Не найден метод баланса. Доступные методы account: [${methods.join(', ')}]`);
-
-        // Также выводим все namespace клиента
-        const namespaces = Object.keys(nadoClient).filter(
-          (k) => typeof nadoClient[k] === 'object' && nadoClient[k] !== null,
-        );
-        log(`   Namespaces клиента: [${namespaces.join(', ')}]`);
-
-        // Пытаемся вызвать первый «похожий» метод
-        for (const method of methods) {
-          if (/balance|info|portfolio|collateral|equity/i.test(method)) {
-            try {
-              const res = await nadoClient.account[method]({ address });
-              log(`   account.${method}() → ${JSON.stringify(res).slice(0, 300)}`);
-              balance = toNum(res?.balance ?? res?.collateral ?? res);
-            } catch (inner) {
-              logErr(`account.${method}`, inner);
-            }
-          }
-        }
-      }
-
-      if (balance === null || balance === undefined) {
-        log('⚠️  Не удалось определить баланс — попробуем ставить ордера и смотреть на ошибку');
-        return true; // пробуем дальше
-      }
-
-      if (balance < MIN_BALANCE) {
-        log(`⛔ Баланс (${balance}) < ${MIN_BALANCE}. Нужно пополнить депозит на Nado.`);
-        return false;
-      }
-
-      log(`✅ Баланс: ${balance}`);
-      return true;
-    } catch (e) {
-      logErr('checkBalance', e);
-      return false;
+  for (const ns of namespaces) {
+    const methods = Object.keys(client[ns]).filter(
+      (m) => typeof client[ns][m] === 'function'
+    );
+    if (methods.length > 0) {
+      log(`SDK namespace "${ns}": [${methods.join(', ')}]`);
     }
   }
 
-  /* ── 2. ЦЕНЫ ── */
+  return { client, address: account.address };
+}
 
+/* ═══════════ BALANCE ═══════════ */
+
+async function discoverAndCheckBalance(client, address) {
+  log('── Проверяю баланс ──');
+
+  // Собираем все «похожие» методы из всех namespace
+  const candidates = [];
+
+  for (const ns of Object.keys(client)) {
+    if (typeof client[ns] !== 'object' || client[ns] === null) continue;
+    for (const method of Object.keys(client[ns])) {
+      if (typeof client[ns][method] !== 'function') continue;
+      if (/balance|account|portfolio|collateral|info|margin|equity/i.test(method)) {
+        candidates.push({ ns, method });
+      }
+    }
+  }
+
+  log(`Кандидаты для баланса: ${candidates.map(c => `${c.ns}.${c.method}`).join(', ') || 'НЕТ'}`);
+
+  for (const { ns, method } of candidates) {
+    try {
+      const res = await client[ns][method]({ address });
+      const dump = JSON.stringify(res, (_, v) =>
+        typeof v === 'bigint' ? v.toString() : v
+      ).slice(0, 500);
+      log(`  ${ns}.${method}() → ${dump}`);
+
+      // Пытаемся вытащить число
+      const val = toNum(
+        res?.balance ?? res?.collateral ?? res?.equity ?? res?.availableBalance ?? res
+      );
+      if (Number.isFinite(val) && val > 0) {
+        log(`✅ Баланс найден: ${val}`);
+        return val;
+      }
+    } catch (e) {
+      err(`${ns}.${method}`, e);
+    }
+  }
+
+  log('⚠️  Баланс не найден автоматически. Пробуем работать — ошибки покажут причину.');
+  return null;
+}
+
+/* ═══════════ BOT ═══════════ */
+
+async function runBot() {
+  /* ── env check ── */
+  const privateKey = process.env.PRIVATE_KEY;
+  if (!privateKey) {
+    log('⛔ PRIVATE_KEY не задан!');
+    log('   Railway → Settings → Variables → добавьте PRIVATE_KEY');
+    process.exit(1);
+  }
+  log(`PRIVATE_KEY загружен (${privateKey.length} символов)`);
+
+  /* ── client ── */
+  const { client, address } = getNadoClient(privateKey);
+
+  const defaultAppendix = String(
+    packOrderAppendix({ orderExecutionType: 'default' })
+  );
+
+  /* ── balance ── */
+  const balance = await discoverAndCheckBalance(client, address);
+
+  if (balance !== null && balance <= 0) {
+    log('⛔ Нулевой баланс. Пополните депозит в app.nado.fi');
+    process.exit(1);
+  }
+
+  /* ── state ── */
+  const lastBidAsk = new Map();
+  let tickCount = 0;
+  let orderOk = 0;
+  let orderFail = 0;
+
+  /* ── prices ── */
   async function fetchPrices() {
     try {
-      const { marketPrices } = await nadoClient.market.getLatestMarketPrices({
+      const result = await client.market.getLatestMarketPrices({
         productIds: PRODUCT_IDS,
       });
 
-      for (const mp of marketPrices) {
+      const prices = result?.marketPrices ?? result?.prices ?? [];
+
+      if (!Array.isArray(prices) || prices.length === 0) {
+        log(`⚠️  getLatestMarketPrices вернул пустое: ${JSON.stringify(result).slice(0, 300)}`);
+        return;
+      }
+
+      for (const mp of prices) {
         const bid = toNum(mp.bid);
         const ask = toNum(mp.ask);
         if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
           lastBidAsk.set(mp.productId, { bid, ask, mid: (bid + ask) / 2 });
         }
       }
-
-      log(`Prices fetched: ${lastBidAsk.size} products`);
     } catch (e) {
-      logErr('fetchPrices', e);   // ← теперь ошибка ВИДНА
+      err('fetchPrices', e);
     }
   }
 
-  /* ── 3. ОРДЕРА ── */
-
-  function getExpirationSec() {
-    return Math.floor(Date.now() / 1000) + 86400;
-  }
-
+  /* ── tick ── */
   async function runTick() {
+    tickCount++;
     await fetchPrices();
 
-    const exp = String(getExpirationSec());
+    const exp = String(Math.floor(Date.now() / 1000) + 86400);
 
-    // cancel existing
+    // cancel
     try {
-      await nadoClient.market.cancelProductOrders({ productIds: PRODUCT_IDS });
+      await client.market.cancelProductOrders({ productIds: PRODUCT_IDS });
     } catch (e) {
-      logErr('cancelOrders', e);  // ← видим ошибку
+      // Может быть нормой, если ордеров нет
+      if (tickCount <= 3) err('cancelOrders', e);
     }
 
     for (const productId of PRODUCT_IDS) {
       const book = lastBidAsk.get(productId);
       if (!book || !Number.isFinite(book.mid) || book.mid <= 0) {
-        log(`⚠️  Нет mid для productId=${productId}, пропускаю`);
+        if (tickCount <= 5) log(`⚠️  pid=${productId}: нет цены`);
         continue;
       }
 
       const buyPrice  = (Math.floor(book.mid * (1 - SPREAD_PCT) * 1e6) / 1e6).toFixed(6);
       const sellPrice = (Math.ceil(book.mid * (1 + SPREAD_PCT) * 1e6) / 1e6).toFixed(6);
 
-      // ── BUY ──
+      // BUY
       try {
-        const txBuy = await nadoClient.market.placeOrder({
+        const res = await client.market.placeOrder({
           productId,
           order: {
             price:      buyPrice,
-            amount:     ORDER_SIZE,               // положительный = buy
+            amount:     ORDER_SIZE,
             expiration: exp,
             appendix:   defaultAppendix,
           },
         });
-        log(`✅ BUY  pid=${productId} price=${buyPrice} tx=${txBuy?.hash ?? JSON.stringify(txBuy).slice(0, 120)}`);
+        orderOk++;
+        if (tickCount <= 5) {
+          log(`✅ BUY  pid=${productId} @ ${buyPrice} → ${JSON.stringify(res).slice(0, 150)}`);
+        }
       } catch (e) {
-        logErr(`placeOrder BUY pid=${productId}`, e);  // ← ВИДИМ причину
+        orderFail++;
+        if (orderFail <= 10 || orderFail % 100 === 0) {
+          err(`BUY pid=${productId} @ ${buyPrice}`, e);
+        }
       }
 
-      // ── SELL ──
+      // SELL
       try {
-        const txSell = await nadoClient.market.placeOrder({
+        const res = await client.market.placeOrder({
           productId,
           order: {
             price:      sellPrice,
-            amount:     String(-Number(ORDER_SIZE)),  // отрицательный = sell
+            amount:     String(-Number(ORDER_SIZE)),
             expiration: exp,
             appendix:   defaultAppendix,
           },
         });
-        log(`✅ SELL pid=${productId} price=${sellPrice} tx=${txSell?.hash ?? JSON.stringify(txSell).slice(0, 120)}`);
+        orderOk++;
+        if (tickCount <= 5) {
+          log(`✅ SELL pid=${productId} @ ${sellPrice} → ${JSON.stringify(res).slice(0, 150)}`);
+        }
       } catch (e) {
-        logErr(`placeOrder SELL pid=${productId}`, e);  // ← ВИДИМ причину
+        orderFail++;
+        if (orderFail <= 10 || orderFail % 100 === 0) {
+          err(`SELL pid=${productId} @ ${sellPrice}`, e);
+        }
       }
     }
   }
 
-  /* ── 4. ЗАПУСК ── */
+  /* ── start ── */
 
-  log('🚀 Проверяю баланс перед стартом…');
-
-  const hasBalance = await checkBalance();
-  if (!hasBalance) {
-    log('⛔ Бот остановлен: нет баланса. Пополните депозит в Nado и перезапустите.');
-    return;
-  }
-
+  log('🚀 Первый fetch цен…');
   await fetchPrices();
 
   if (lastBidAsk.size === 0) {
-    log('⚠️  Не получил ни одной цены. Проверьте PRODUCT_IDS и доступность API.');
+    log('⚠️  Цены пустые. Проверьте PRODUCT_IDS и доступность Nado API.');
+    log('   Продолжаю — может появиться позже.');
+  } else {
+    for (const [pid, v] of lastBidAsk) {
+      log(`   pid=${pid}: bid=${v.bid} ask=${v.ask} mid=${v.mid.toFixed(2)}`);
+    }
   }
 
-  log('✅ Запускаю цикл маркетмейкинга');
+  log(`🔄 Запускаю тики каждые ${TICK_MS} мс`);
 
   setInterval(() => {
-    runTick().catch((e) => logErr('runTick', e));
+    runTick().catch((e) => err('runTick', e));
   }, TICK_MS);
 
-  // мониторинг
-  setInterval(async () => {
-    const entries = Array.from(lastBidAsk.entries())
+  // Мониторинг
+  setInterval(() => {
+    const mids = Array.from(lastBidAsk.entries())
       .map(([pid, v]) => `pid${pid}=${v.mid.toFixed(2)}`)
       .join(' | ');
-    log(`Mid: ${entries || '—'}`);
-  }, 60_000);
+    log(`📊 ${mids || 'нет цен'} | ticks=${tickCount} ok=${orderOk} fail=${orderFail}`);
+  }, LOG_INTERVAL);
 }
+
+/* ═══════════ ENTRY ═══════════ */
 
 runBot().catch((e) => {
   console.error('FATAL:', e);
