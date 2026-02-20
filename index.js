@@ -1,7 +1,7 @@
 /**
- * Nado Volume Bot — по документации @nadohq/client (docs.nado.xyz)
- * SDK экспортирует createNadoClient; используем как getNadoClient для совместимости.
- * Orderbook: polling getLatestMarketPrices (в SDK нет client.on/subscribe для orderbook).
+ * Nado Volume Bot — @nadohq/client
+ * Баланс через client.subaccount.getSubaccountSummary
+ * Ожидание депозита, если баланс < 30 USDC0.
  */
 require('dotenv').config();
 const { createPublicClient, createWalletClient, http } = require('viem');
@@ -10,38 +10,36 @@ const {
   createNadoClient,
   CHAIN_ENV_TO_CHAIN,
   packOrderAppendix,
+  QUOTE_PRODUCT_ID,
 } = require('@nadohq/client');
 
-// getNadoClient — алиас createNadoClient (официальный экспорт из @nadohq/client)
-const getNadoClient = createNadoClient;
-
 // --- Конфиг ---
-const CHAIN_ENV = 'inkMainnet'; // Ink Mainnet
-const PRODUCT_IDS = [1, 2]; // 1 = BTC-perp, 2 = ETH-perp
-const SPREAD_PCT = 0.00015; // 0.015% от mid
+const CHAIN_ENV = 'inkMainnet';
+const PRODUCT_IDS = [1, 2]; // BTC-perp, ETH-perp
+const SPREAD_PCT = 0.00015; // 0.015%
 const ORDER_SIZE = String(process.env.ORDER_SIZE || 15);
-const TICK_MS = 200; // каждые 200 мс
-const LOG_INTERVAL_MS = 60 * 1000; // лог каждые 60 сек
-const VOLUME_WINDOW_MS = 5 * 60 * 1000; // объём за 5 мин
+const MIN_BALANCE_USDC = 30;
+const TICK_MS = 200;
+const LOG_INTERVAL_MS = 60 * 1000;
+const VOLUME_WINDOW_MS = 5 * 60 * 1000;
+const WAIT_LOG_MS = 10 * 1000; // "Жду баланса..." каждые 10 сек
 
 function log(msg) {
   const ts = new Date().toISOString();
   console.log(`[${ts}] ${msg}`);
 }
 
-function safeRun(fn) {
-  try {
-    return fn();
-  } catch (e) {
-    log(`ERROR: ${e && e.message ? e.message : String(e)}`);
-    return undefined;
-  }
+function toNum(v) {
+  if (v == null) return NaN;
+  if (typeof v === 'object' && v != null && typeof v.toNumber === 'function')
+    return v.toNumber();
+  return Number(v);
 }
 
 function runBot() {
   const rawKey = process.env.PRIVATE_KEY;
   if (!rawKey) {
-    log('ERROR: PRIVATE_KEY не задан в process.env.PRIVATE_KEY');
+    log('ERROR: PRIVATE_KEY не задан');
     process.exit(1);
   }
   const privateKey =
@@ -56,29 +54,40 @@ function runBot() {
     transport: http(),
   });
 
-  const client = getNadoClient(CHAIN_ENV, {
+  const client = createNadoClient(CHAIN_ENV, {
     publicClient,
     walletClient,
   });
 
   const defaultAppendix = String(packOrderAppendix({ orderExecutionType: 'default' }));
+  const subaccountName = process.env.SUBACCOUNT_NAME || '';
 
   const lastBidAsk = new Map();
   let volumeQuoteLast5Min = 0;
   let lastVolumeResetTime = Date.now();
   let tickInterval = null;
   let logInterval = null;
-  let reconnectScheduled = false;
+  let balanceUsdc = 0;
+  let hasStarted = false;
+  let waitLogInterval = null;
 
   function getExpirationSec() {
     return Math.floor(Date.now() / 1000) + 86400;
   }
 
-  function toNum(v) {
-    if (v == null) return NaN;
-    if (typeof v === 'object' && v != null && typeof v.toNumber === 'function')
-      return v.toNumber();
-    return Number(v);
+  async function getBalanceUsdc() {
+    try {
+      const summary = await client.subaccount.getSubaccountSummary({
+        subaccountOwner: account.address,
+        subaccountName,
+      });
+      if (!summary || !summary.balances) return 0;
+      const quoteBal = summary.balances.find((b) => b.productId === QUOTE_PRODUCT_ID);
+      if (!quoteBal) return 0;
+      return toNum(quoteBal.amount);
+    } catch (_) {
+      return 0;
+    }
   }
 
   async function fetchPrices() {
@@ -93,20 +102,18 @@ function runBot() {
           lastBidAsk.set(mp.productId, { bid, ask, mid: (bid + ask) / 2 });
         }
       }
-      reconnectScheduled = false;
-    } catch (err) {
-      log(`ERROR: getLatestMarketPrices ${err && err.message ? err.message : err}`);
-      if (!reconnectScheduled) {
-        reconnectScheduled = true;
-        log('Авто-reconnect через 5 сек…');
-        setTimeout(() => {
-          fetchPrices().catch(() => {});
-        }, 5000);
-      }
-    }
+    } catch (_) {}
+  }
+
+  function ignore2024(err) {
+    if (err && (String(err.code) === '2024' || String(err.message || '').includes('2024')))
+      return;
+    log(`ERROR: ${err && err.message ? err.message : err}`);
   }
 
   async function runTick() {
+    if (balanceUsdc < MIN_BALANCE_USDC) return;
+
     const havePrices = PRODUCT_IDS.every((id) => lastBidAsk.has(id));
     if (!havePrices) {
       await fetchPrices();
@@ -118,7 +125,7 @@ function runBot() {
     try {
       await client.market.cancelProductOrders({ productIds: PRODUCT_IDS });
     } catch (err) {
-      log(`ERROR: cancelProductOrders ${err && err.message ? err.message : err}`);
+      ignore2024(err);
       return;
     }
 
@@ -138,7 +145,7 @@ function runBot() {
           },
         });
       } catch (err) {
-        log(`ERROR: place buy ${productId} ${err && err.message ? err.message : err}`);
+        ignore2024(err);
       }
       try {
         await client.market.placeOrder({
@@ -151,27 +158,53 @@ function runBot() {
           },
         });
       } catch (err) {
-        log(`ERROR: place sell ${productId} ${err && err.message ? err.message : err}`);
+        ignore2024(err);
       }
     }
   }
 
   function scheduleTick() {
     if (tickInterval) clearInterval(tickInterval);
-    tickInterval = setInterval(() => {
-      runTick().catch((err) => {
-        log(`ERROR: tick ${err && err.message ? err.message : err}`);
-      });
-    }, TICK_MS);
+    tickInterval = setInterval(() => runTick().catch(() => {}), TICK_MS);
   }
 
-  async function start() {
-    await fetchPrices();
-    scheduleTick();
+  function startWaitLoop() {
+    if (waitLogInterval) clearInterval(waitLogInterval);
+    waitLogInterval = setInterval(() => {
+      log('Жду баланса после депозита...');
+    }, WAIT_LOG_MS);
+  }
+
+  function stopWaitLoop() {
+    if (waitLogInterval) {
+      clearInterval(waitLogInterval);
+      waitLogInterval = null;
+    }
+  }
+
+  async function balanceCheckLoop() {
+    for (;;) {
+      balanceUsdc = await getBalanceUsdc();
+      if (balanceUsdc >= MIN_BALANCE_USDC) {
+        stopWaitLoop();
+        if (!hasStarted) {
+          hasStarted = true;
+          log(`Баланс ${balanceUsdc.toFixed(2)} USDC0 — запуск цикла`);
+          await fetchPrices();
+          scheduleTick();
+        }
+      } else {
+        if (!hasStarted) {
+          startWaitLoop();
+        }
+      }
+      await new Promise((r) => setTimeout(r, 5000));
+    }
   }
 
   if (logInterval) clearInterval(logInterval);
-  logInterval = setInterval(() => {
+  logInterval = setInterval(async () => {
+    balanceUsdc = await getBalanceUsdc();
     const now = Date.now();
     if (now - lastVolumeResetTime >= VOLUME_WINDOW_MS) {
       volumeQuoteLast5Min = 0;
@@ -186,23 +219,24 @@ function runBot() {
         ? String(Math.round(midFirst * 100) / 100)
         : '—';
     const vol = Math.round(volumeQuoteLast5Min * 100) / 100;
-    log(`Mid: ${midStr} | Размер ордера: ${ORDER_SIZE} | Объём за 5 мин: ${vol} USDC`);
+    log(`Mid: ${midStr} | Объём за 5 мин: ${vol} USDC | Баланс: ${balanceUsdc.toFixed(2)} USDC0`);
   }, LOG_INTERVAL_MS);
 
-  start().catch((err) => {
-    log(`ERROR: start ${err && err.message ? err.message : err}`);
-    log('Авто-reconnect через 5 сек…');
-    setTimeout(() => start().catch(() => {}), 5000);
+  balanceCheckLoop().catch((err) => {
+    log(`ERROR: ${err && err.message ? err.message : err}`);
+    setTimeout(() => balanceCheckLoop().catch(() => {}), 5000);
   });
 
-  log(
-    `Nado volume bot запущен. Chain: ${CHAIN_ENV}, products: ${PRODUCT_IDS.join(', ')}, spread: ${SPREAD_PCT * 100}%, ORDER_SIZE: ${ORDER_SIZE}`
-  );
+  log(`Nado volume bot запущен. Chain: ${CHAIN_ENV}, ORDER_SIZE: ${ORDER_SIZE}, мин. баланс: ${MIN_BALANCE_USDC} USDC0`);
 }
 
-safeRun(runBot);
+try {
+  runBot();
+} catch (e) {
+  log(`ERROR: ${e && e.message ? e.message : e}`);
+}
 process.on('uncaughtException', (err) => {
-  log(`FATAL: uncaughtException ${err && err.message ? err.message : err}`);
+  log(`FATAL: ${err && err.message ? err.message : err}`);
 });
 process.on('unhandledRejection', (reason) => {
   log(`FATAL: unhandledRejection ${reason}`);
