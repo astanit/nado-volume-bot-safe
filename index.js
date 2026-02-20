@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { createPublicClient, createWalletClient, http } = require('viem');
+const { createPublicClient, createWalletClient, http, parseUnits, formatUnits, getContract } = require('viem');
 const { privateKeyToAccount } = require('viem/accounts');
 const {
   createNadoClient,
@@ -11,185 +11,242 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
 async function diagnose() {
   const privateKey = process.env.PRIVATE_KEY;
-  if (!privateKey) {
-    log('⛔ PRIVATE_KEY не задан');
-    process.exit(1);
-  }
+  if (!privateKey) { log('⛔ PRIVATE_KEY не задан'); process.exit(1); }
 
   const pk = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
   const account = privateKeyToAccount(pk);
-
-  log('');
-  log('╔═══════════════════════════════════════════════════╗');
-  log('║           NADO BOT — ДИАГНОСТИКА АДРЕСА          ║');
-  log('╚═══════════════════════════════════════════════════╝');
-  log('');
-  log(`🔑 Адрес из PRIVATE_KEY: ${account.address}`);
-  log('');
-  log('⬆️  СРАВНИТЕ этот адрес с адресом в app.nado.fi!');
-  log('   Откройте app.nado.fi → подключите кошелёк →');
-  log('   скопируйте адрес → должен быть ИДЕНТИЧЕН.');
-  log('');
-
-  // Создаём клиент
   const chainConfig = CHAIN_ENV_TO_CHAIN.inkMainnet;
+
   const publicClient = createPublicClient({ chain: chainConfig, transport: http() });
   const walletClient = createWalletClient({ account, chain: chainConfig, transport: http() });
   const client = createNadoClient('inkMainnet', { publicClient, walletClient });
 
-  // Дампим ВСЕ методы SDK
-  log('── Все методы SDK ──');
+  log('');
+  log('══════════════════════════════════════════');
+  log(`  Адрес кошелька: ${account.address}`);
+  log('══════════════════════════════════════════');
+  log('');
+
+  // ═══ 1. ПОЛНЫЙ ДАМП SDK ═══
+  log('── 1. ВСЕ методы SDK (полный список) ──');
   const allMethods = [];
-  for (const ns of Object.keys(client)) {
-    if (typeof client[ns] !== 'object' || client[ns] === null) continue;
-    for (const m of Object.keys(client[ns])) {
-      if (typeof client[ns][m] === 'function') {
-        allMethods.push(`${ns}.${m}`);
+  
+  function dumpObj(obj, prefix = '') {
+    if (!obj || typeof obj !== 'object') return;
+    for (const key of Object.keys(obj)) {
+      const val = obj[key];
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (typeof val === 'function') {
+        allMethods.push(path);
+        log(`  📌 ${path}()`);
+      } else if (typeof val === 'object' && val !== null && !path.includes('.context')) {
+        // Идём на 1 уровень глубже
+        if (prefix.split('.').length < 2) {
+          dumpObj(val, path);
+        }
+      } else if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+        log(`  📎 ${path} = ${String(val).slice(0, 200)}`);
       }
     }
   }
-  log(allMethods.join('\n'));
+  
+  dumpObj(client);
+  log(`  Итого методов: ${allMethods.length}`);
   log('');
 
-  // Пробуем ВСЕ методы которые могут вернуть инфу об аккаунте
-  log('── Пробуем методы аккаунта/баланса ──');
+  await sleep(500);
 
-  for (const fullName of allMethods) {
-    if (!/account|balance|deposit|portfolio|collateral|margin|info|user|trader|position/i.test(fullName)) {
-      continue;
-    }
-
-    const [ns, m] = fullName.split('.');
-
-    // Пробуем разные варианты параметров
-    const paramVariants = [
-      { address: account.address },
-      { account: account.address },
-      { trader: account.address },
-      { user: account.address },
-      { owner: account.address },
-      {},
-    ];
-
-    for (const params of paramVariants) {
-      try {
-        const res = await client[ns][m](params);
-        const dump = JSON.stringify(res, (_, v) =>
-          typeof v === 'bigint' ? v.toString() : v
-        ).slice(0, 600);
-        log(`✅ ${fullName}(${JSON.stringify(params)}) →`);
-        log(`   ${dump}`);
-        log('');
-        break; // нашли рабочий вариант
-      } catch (e) {
-        const msg = e?.message || '';
-        // Пропускаем «не те параметры» молча, но логируем содержательные ошибки
-        if (msg.includes('no previous deposits') || msg.includes('2024')) {
-          log(`❌ ${fullName}(${JSON.stringify(params)}) → NO DEPOSITS`);
-          break;
+  // ═══ 2. CONTEXT — ищем sub-account, vault address и т.д. ═══
+  log('── 2. Context клиента ──');
+  if (client.context) {
+    const ctx = client.context;
+    for (const k of Object.keys(ctx)) {
+      const v = ctx[k];
+      if (typeof v === 'string' || typeof v === 'number') {
+        log(`  context.${k} = ${v}`);
+      } else if (typeof v === 'object' && v !== null) {
+        // Если это не огромный объект, дампим ключи
+        const subKeys = Object.keys(v);
+        if (subKeys.length < 20) {
+          for (const sk of subKeys) {
+            if (typeof v[sk] === 'string' || typeof v[sk] === 'number') {
+              log(`  context.${k}.${sk} = ${v[sk]}`);
+            }
+          }
+        } else {
+          log(`  context.${k} = [object with ${subKeys.length} keys]`);
         }
       }
     }
-
-    // Пауза чтобы не словить 429
-    await new Promise((r) => setTimeout(r, 1000));
   }
-
   log('');
-  log('── Проверяю context клиента ──');
-  
-  // Проверяем что лежит в context
-  if (client.context) {
-    const ctx = client.context;
-    log(`context.walletClient.account.address: ${ctx.walletClient?.account?.address}`);
-    
-    // Может быть sub-account
-    if (ctx.account) {
-      log(`context.account: ${JSON.stringify(ctx.account, (_, v) => typeof v === 'bigint' ? v.toString() : v).slice(0, 300)}`);
-    }
-    if (ctx.subAccount || ctx.subaccount) {
-      log(`context.subAccount: ${ctx.subAccount || ctx.subaccount}`);
-    }
 
-    // Дампим весь context
-    const ctxKeys = Object.keys(ctx);
-    log(`context keys: [${ctxKeys.join(', ')}]`);
+  await sleep(500);
+
+  // ═══ 3. ИЩЕМ DEPOSIT / REGISTER МЕТОДЫ ═══
+  log('── 3. Поиск deposit/register/vault методов ──');
+  
+  const depositMethods = allMethods.filter(m =>
+    /deposit|register|create|init|vault|approve|sub.?account|collateral|fund/i.test(m)
+  );
+  
+  if (depositMethods.length > 0) {
+    log(`  Найдены: [${depositMethods.join(', ')}]`);
+  } else {
+    log('  ❌ Ни одного метода deposit/register не найдено');
+  }
+  log('');
+
+  // ═══ 4. ПРОБУЕМ ВЫЗВАТЬ НАЙДЕННЫЕ МЕТОДЫ ═══
+  log('── 4. Пробуем вызвать методы ──');
+  
+  for (const methodPath of depositMethods) {
+    const parts = methodPath.split('.');
+    let fn = client;
+    for (const p of parts) fn = fn[p];
     
-    for (const k of ctxKeys) {
-      if (typeof ctx[k] === 'string' || typeof ctx[k] === 'number') {
-        log(`  context.${k} = ${ctx[k]}`);
+    if (typeof fn !== 'function') continue;
+    
+    // Пробуем разные варианты аргументов
+    const variants = [
+      {},
+      { address: account.address },
+      { amount: '0' },
+      { address: account.address, amount: '0' },
+    ];
+    
+    for (const args of variants) {
+      try {
+        log(`  Пробую ${methodPath}(${JSON.stringify(args)}) ...`);
+        const res = await fn(args);
+        const dump = JSON.stringify(res, (_, v) =>
+          typeof v === 'bigint' ? v.toString() : v
+        ).slice(0, 500);
+        log(`  ✅ ${methodPath} → ${dump}`);
+        break;
+      } catch (e) {
+        const msg = (e?.message || '').slice(0, 200);
+        log(`     → ${msg}`);
+      }
+    }
+    
+    await sleep(1000);
+  }
+  log('');
+
+  // ═══ 5. ИЩЕМ АДРЕСА КОНТРАКТОВ NADO В КОНФИГЕ ═══
+  log('── 5. Адреса контрактов из SDK ──');
+  
+  function findAddresses(obj, prefix = '', depth = 0) {
+    if (depth > 3 || !obj || typeof obj !== 'object') return;
+    for (const key of Object.keys(obj)) {
+      const val = obj[key];
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (typeof val === 'string' && /^0x[a-fA-F0-9]{40}$/.test(val)) {
+        log(`  📍 ${path} = ${val}`);
+      } else if (typeof val === 'object' && val !== null) {
+        findAddresses(val, path, depth + 1);
       }
     }
   }
-
+  
+  findAddresses(CHAIN_ENV_TO_CHAIN.inkMainnet, 'chainConfig');
+  if (client.context) findAddresses(client.context, 'context');
   log('');
-  log('── Тестовый ордер (для диагностики ошибки) ──');
 
+  await sleep(500);
+
+  // ═══ 6. ПРОВЕРЯЕМ ON-CHAIN — был ли deposit на контракт ═══
+  log('── 6. On-chain проверка ──');
+  
+  // Проверяем нативный баланс
   try {
-    const { marketPrices } = await client.market.getLatestMarketPrices({
-      productIds: [1],
-    });
-
-    const bid = Number(marketPrices[0]?.bid || 0);
-    const ask = Number(marketPrices[0]?.ask || 0);
-    const mid = (bid + ask) / 2;
-
-    if (mid > 0) {
-      const price = (Math.floor(mid * 0.999 * 100) / 100).toFixed(6);
-      const appendix = String(packOrderAppendix({ orderExecutionType: 'default' }));
-      const exp = String(Math.floor(Date.now() / 1000) + 86400);
-
-      log(`Пробую BUY pid=1 price=${price} amount=1 ...`);
-
-      const res = await client.market.placeOrder({
-        productId: 1,
-        order: {
-          price,
-          amount: '1',
-          expiration: exp,
-          appendix,
-        },
-      });
-
-      log(`✅ Ордер прошёл! ${JSON.stringify(res).slice(0, 300)}`);
-    }
+    const ethBal = await publicClient.getBalance({ address: account.address });
+    log(`  ETH баланс: ${formatUnits(ethBal, 18)}`);
   } catch (e) {
-    const msg = e?.message || String(e);
-    log(`❌ Тестовый ордер: ${msg.slice(0, 500)}`);
-
-    // Если 2024 — точно не тот адрес
-    if (msg.includes('2024') || msg.includes('no previous deposits')) {
-      log('');
-      log('╔═══════════════════════════════════════════════════╗');
-      log('║  ⛔ ВЕРДИКТ: АДРЕС НЕ СОВПАДАЕТ С ДЕПОЗИТОМ     ║');
-      log('╠═══════════════════════════════════════════════════╣');
-      log(`║  Бот использует:  ${account.address}  ║`);
-      log('║                                                   ║');
-      log('║  Что делать:                                      ║');
-      log('║  1) Откройте app.nado.fi                          ║');
-      log('║  2) Подключите кошелёк                            ║');
-      log('║  3) Скопируйте адрес из интерфейса                ║');
-      log('║  4) Сравните с адресом выше                        ║');
-      log('║                                                   ║');
-      log('║  Варианты:                                        ║');
-      log('║  A) Адреса разные → замените PRIVATE_KEY          ║');
-      log('║     в Railway на ключ от правильного кошелька      ║');
-      log('║                                                   ║');
-      log('║  B) Адреса одинаковые → Nado использует            ║');
-      log('║     sub-account (смарт-контракт), а SDK             ║');
-      log('║     шлёт от EOA. Нужно найти метод                ║');
-      log('║     registerSubAccount или deposit в SDK.          ║');
-      log('╚═══════════════════════════════════════════════════╝');
-    }
+    log(`  ❌ getBalance: ${e.message}`);
   }
 
+  // Распространённые адреса USDC на Ink
+  const possibleUSDC = [
+    '0x0200C29006150606B650577BBE7B6248F6995ABD', // возможный USDC на Ink
+    '0xF1815bd50389c46847f0Bda824eC8da914045D14', // другой
+  ];
+
+  const erc20Abi = [
+    { name: 'balanceOf', type: 'function', stateMutability: 'view',
+      inputs: [{ name: 'account', type: 'address' }],
+      outputs: [{ name: '', type: 'uint256' }] },
+    { name: 'allowance', type: 'function', stateMutability: 'view',
+      inputs: [{ name: 'owner', type: 'address' }, { name: 'spender', type: 'address' }],
+      outputs: [{ name: '', type: 'uint256' }] },
+    { name: 'symbol', type: 'function', stateMutability: 'view',
+      inputs: [], outputs: [{ name: '', type: 'string' }] },
+    { name: 'decimals', type: 'function', stateMutability: 'view',
+      inputs: [], outputs: [{ name: '', type: 'uint8' }] },
+  ];
+
+  for (const tokenAddr of possibleUSDC) {
+    try {
+      const token = getContract({
+        address: tokenAddr,
+        abi: erc20Abi,
+        client: publicClient,
+      });
+      const [symbol, decimals, balance] = await Promise.all([
+        token.read.symbol(),
+        token.read.decimals(),
+        token.read.balanceOf([account.address]),
+      ]);
+      log(`  Token ${tokenAddr}: ${symbol} balance = ${formatUnits(balance, decimals)}`);
+    } catch (e) {
+      log(`  Token ${tokenAddr}: не найден или ошибка`);
+    }
+  }
   log('');
-  log('Диагностика завершена. Проверьте вывод выше.');
+
+  // ═══ 7. ПРОВЕРЯЕМ ВСЕ account/user МЕТОДЫ ═══
+  log('── 7. Все методы с данными об аккаунте ──');
+  
+  const accountMethods = allMethods.filter(m =>
+    /account|user|trader|balance|position|portfolio|info|state|status/i.test(m)
+  );
+  
+  for (const methodPath of accountMethods) {
+    const parts = methodPath.split('.');
+    let fn = client;
+    for (const p of parts) fn = fn[p];
+    if (typeof fn !== 'function') continue;
+
+    try {
+      log(`  ${methodPath}({ address }) ...`);
+      const res = await fn({ address: account.address });
+      const dump = JSON.stringify(res, (_, v) =>
+        typeof v === 'bigint' ? v.toString() : v
+      ).slice(0, 500);
+      log(`  ✅ → ${dump}`);
+    } catch (e) {
+      log(`  ❌ → ${(e?.message || '').slice(0, 200)}`);
+    }
+
+    await sleep(1000);
+  }
+  log('');
+
+  // ═══ 8. ИТОГ ═══
+  log('══════════════════════════════════════════════════════');
+  log('  ДИАГНОСТИКА ЗАВЕРШЕНА');
+  log('  Скопируйте ВЕСЬ лог и отправьте — я скажу что делать');
+  log('══════════════════════════════════════════════════════');
 }
 
-diagnose().catch((e) => {
+diagnose().catch(e => {
   console.error('FATAL:', e);
   process.exit(1);
 });
