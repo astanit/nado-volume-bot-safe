@@ -1,7 +1,8 @@
 /**
- * Nado Volume Bot — docs.nado.xyz 2026
- * getNadoClient({ privateKey, chain }) — обёртка над createNadoClient
- * SDK не имеет client.subscribe / client.on('orderbook') — используем polling getLatestMarketPrices
+ * Nado Volume Bot — @nadohq/client (docs.nado.xyz 2026)
+ * getNadoClient({ privateKey, chain })
+ * Баланс: getSubaccountSummary → productId === 0 (USDC0)
+ * SDK не имеет client.on/subscribe для orderbook — polling getLatestMarketPrices
  */
 require('dotenv').config();
 const { createPublicClient, createWalletClient, http } = require('viem');
@@ -10,7 +11,6 @@ const {
   createNadoClient,
   CHAIN_ENV_TO_CHAIN,
   packOrderAppendix,
-  QUOTE_PRODUCT_ID,
 } = require('@nadohq/client');
 
 function getNadoClient({ privateKey, chain }) {
@@ -32,7 +32,8 @@ function getNadoClient({ privateKey, chain }) {
 
 // --- Конфиг ---
 const PRODUCT_IDS = [1, 2]; // BTC-perp, ETH-perp
-const SPREAD_PCT = 0.00015;
+const QUOTE_PRODUCT_ID = 0; // USDC0
+const SPREAD_PCT = 0.00015; // 0.015%
 const ORDER_SIZE = '15';
 const MIN_BALANCE_USDC = 30;
 const TICK_MS = 200;
@@ -64,12 +65,14 @@ function runBot() {
     chain: 'inkMainnet',
   });
 
-  const account = privateKeyToAccount(
-    typeof privateKey === 'string' && !privateKey.startsWith('0x')
-      ? `0x${privateKey}`
-      : privateKey
-  );
-  const subaccountOwner = account.address;
+  // Адрес: context.walletClient.account (signer — wallet в SDK)
+  const address = nadoClient.context.walletClient?.account?.address;
+  if (!address) {
+    log('ERROR: нет wallet/signer в контексте');
+    process.exit(1);
+  }
+
+  const subaccountOwner = address;
   const subaccountName = 'default';
 
   const defaultAppendix = String(packOrderAppendix({ orderExecutionType: 'default' }));
