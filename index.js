@@ -1,7 +1,7 @@
 require('dotenv').config();
 const {
   createPublicClient, createWalletClient, http,
-  formatUnits, parseUnits, encodeFunctionData, getContract
+  formatUnits, parseUnits, getContract, maxUint256,
 } = require('viem');
 const { privateKeyToAccount } = require('viem/accounts');
 const {
@@ -13,333 +13,352 @@ const {
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ═══ ABI ═══
+const erc20Abi = [
+  { name: 'symbol',    type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
+  { name: 'name',      type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
+  { name: 'decimals',  type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint8' }] },
+  { name: 'balanceOf', type: 'function', stateMutability: 'view',
+    inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] },
+  { name: 'allowance', type: 'function', stateMutability: 'view',
+    inputs: [{ type: 'address' }, { type: 'address' }], outputs: [{ type: 'uint256' }] },
+  { name: 'approve',   type: 'function', stateMutability: 'nonpayable',
+    inputs: [{ type: 'address' }, { type: 'uint256' }], outputs: [{ type: 'bool' }] },
+];
+
+// Vertex-style deposit — Nado это форк Vertex
+const endpointAbi = [
+  {
+    name: 'depositCollateral',
+    type: 'function',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'subaccountName', type: 'bytes12' },
+      { name: 'productId',     type: 'uint32'  },
+      { name: 'amount',        type: 'uint128' },
+    ],
+    outputs: [],
+  },
+  {
+    name: 'getQuote',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ type: 'address' }],
+  },
+];
+
+// ═══ CONFIG ═══
+const ENDPOINT_ADDR = '0x05ec92D78ED421f3D3Ada77FFdE167106565974E';
+const USDT0_ADDR    = '0x0200C29006150606B650577BBE7B6248F58470c1';
+const PRODUCT_IDS   = [1, 2];
+const SPREAD_PCT    = 0.00015;
+const ORDER_SIZE    = '15';
+const TICK_MS       = 5000;
+const MAX_TICK_MS   = 60000;
+
+// "default" в bytes12 = 0x64656661756c740000000000
+const DEFAULT_SUBACCOUNT = '0x64656661756c740000000000';
+
 async function main() {
   const privateKey = process.env.PRIVATE_KEY;
   if (!privateKey) { log('⛔ PRIVATE_KEY not set'); process.exit(1); }
 
   const pk = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
-  const account = privateKeyToAccount(pk);
+  const account     = privateKeyToAccount(pk);
   const chainConfig = CHAIN_ENV_TO_CHAIN.inkMainnet;
-  const publicClient = createPublicClient({ chain: chainConfig, transport: http() });
-  const walletClient = createWalletClient({ account, chain: chainConfig, transport: http() });
-  const client = createNadoClient('inkMainnet', { publicClient, walletClient });
+  const publicClient  = createPublicClient({ chain: chainConfig, transport: http() });
+  const walletClient  = createWalletClient({ account, chain: chainConfig, transport: http() });
+  const nadoClient    = createNadoClient('inkMainnet', { publicClient, walletClient });
 
-  log(`Кошелёк: ${account.address}`);
+  log('════════════════════════════════════════════');
+  log(`  Кошелёк: ${account.address}`);
+  log('════════════════════════════════════════════');
+
+  // ═══ 1. ПРОВЕРЯЕМ USDT0 ═══
   log('');
+  log('═══ 1. БАЛАНС USDT0 ═══');
 
-  // ═══════════════════════════════════════════════
-  // 1. РЕАЛЬНЫЕ МЕТОДЫ NADO SDK (без context/viem)
-  // ═══════════════════════════════════════════════
-  log('═══ 1. МЕТОДЫ NADO SDK (top-level) ═══');
+  const usdt0 = getContract({
+    address: USDT0_ADDR,
+    abi: erc20Abi,
+    client: { public: publicClient, wallet: walletClient },
+  });
 
-  for (const ns of Object.keys(client)) {
-    if (ns === 'context') continue;
+  let symbol, decimals, balance, allowance;
+  try {
+    [symbol, decimals, balance, allowance] = await Promise.all([
+      usdt0.read.symbol(),
+      usdt0.read.decimals(),
+      usdt0.read.balanceOf([account.address]),
+      usdt0.read.allowance([account.address, ENDPOINT_ADDR]),
+    ]);
 
-    const val = client[ns];
+    const name = await usdt0.read.name().catch(() => '???');
 
-    if (typeof val === 'function') {
-      log(`  client.${ns}()`);
-      continue;
+    log(`  Токен:     ${name} (${symbol})`);
+    log(`  Decimals:  ${decimals}`);
+    log(`  Баланс:    ${formatUnits(balance, decimals)} ${symbol}`);
+    log(`  Allowance: ${formatUnits(allowance, decimals)} → Endpoint`);
+  } catch (e) {
+    log(`  ❌ Не могу прочитать USDT0: ${e.message?.slice(0, 200)}`);
+    log('  Пробую продолжить...');
+    decimals = 6;
+    balance = 0n;
+    allowance = 0n;
+    symbol = 'USDT0';
+  }
+
+  // ═══ 2. APPROVE + DEPOSIT если есть баланс ═══
+  if (balance > 0n) {
+    log('');
+    log('═══ 2. APPROVE + DEPOSIT ═══');
+
+    // Approve если нужно
+    if (allowance < balance) {
+      log(`  Approve ${symbol} для Endpoint...`);
+      try {
+        const hash = await usdt0.write.approve([ENDPOINT_ADDR, maxUint256]);
+        log(`  ✅ Approve tx: ${hash}`);
+        log('  Ждём подтверждения...');
+        await publicClient.waitForTransactionReceipt({ hash });
+        log('  ✅ Approve подтверждён');
+      } catch (e) {
+        log(`  ❌ Approve failed: ${e.message?.slice(0, 300)}`);
+        log('  Пробую депозит без нового approve...');
+      }
+      await sleep(2000);
+    } else {
+      log('  Approve уже есть ✅');
     }
 
-    if (typeof val === 'object' && val !== null) {
-      const methods = Object.keys(val).filter(m => typeof val[m] === 'function');
-      const props   = Object.keys(val).filter(m => typeof val[m] !== 'function');
+    // Deposit
+    log(`  Deposit ${formatUnits(balance, decimals)} ${symbol} в Nado...`);
 
-      if (methods.length > 0) {
-        log(`  📂 client.${ns}:`);
-        for (const m of methods) {
-          log(`      .${m}()`);
-        }
-      }
-      if (props.length > 0) {
-        for (const p of props) {
-          const v = val[p];
-          if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
-            log(`      .${p} = ${v}`);
+    const endpoint = getContract({
+      address: ENDPOINT_ADDR,
+      abi: endpointAbi,
+      client: { public: publicClient, wallet: walletClient },
+    });
+
+    try {
+      const hash = await endpoint.write.depositCollateral([
+        DEFAULT_SUBACCOUNT,  // bytes12 "default"
+        0,                   // productId 0 = quote token
+        balance,             // весь баланс
+      ]);
+      log(`  ✅ Deposit tx: ${hash}`);
+      log('  Ждём подтверждения...');
+      await publicClient.waitForTransactionReceipt({ hash });
+      log('  ✅ Deposit подтверждён!');
+    } catch (e) {
+      const msg = e.message || '';
+      log(`  ❌ Deposit failed: ${msg.slice(0, 400)}`);
+
+      // Пробуем другой вариант subaccount name
+      if (msg.includes('revert') || msg.includes('execution')) {
+        log('  Пробую другие варианты subaccount name...');
+
+        const subaccountVariants = [
+          '0x000000000000000000000000',  // пустое имя
+          '0x6d61696e0000000000000000',  // "main"
+          '0x747261646500000000000000',  // "trade"
+        ];
+
+        for (const sub of subaccountVariants) {
+          try {
+            log(`    Пробую subaccount: ${sub}`);
+            const hash = await endpoint.write.depositCollateral([
+              sub, 0, balance,
+            ]);
+            log(`    ✅ Deposit tx: ${hash}`);
+            await publicClient.waitForTransactionReceipt({ hash });
+            log('    ✅ Deposit подтверждён!');
+            break;
+          } catch (e2) {
+            log(`    ❌ ${e2.message?.slice(0, 150)}`);
           }
         }
       }
     }
+
+    // Проверяем результат
+    await sleep(3000);
+    const newBal = await usdt0.read.balanceOf([account.address]);
+    log(`  Баланс ${symbol} после депозита: ${formatUnits(newBal, decimals)}`);
+
+  } else {
+    log('');
+    log('  ⚠️  Баланс USDT0 = 0');
+    log('  Два варианта:');
+    log('  A) Депозит уже сделан → пробуем торговать');
+    log('  B) Нет средств → пополните USDT0 на Ink chain');
+    log('     и перезапустите бота');
   }
+
+  // ═══ 3. ТЕСТОВЫЙ ОРДЕР ═══
   log('');
+  log('═══ 3. ТЕСТОВЫЙ ОРДЕР ═══');
 
-  // ═══════════════════════════════════════════════
-  // 2. ИЩЕМ DEPOSIT / SUBACCOUNT МЕТОДЫ
-  // ═══════════════════════════════════════════════
-  log('═══ 2. ПОИСК DEPOSIT/SUBACCOUNT ═══');
-
-  for (const ns of Object.keys(client)) {
-    if (ns === 'context') continue;
-    const val = client[ns];
-    if (typeof val !== 'object' || val === null) continue;
-
-    for (const m of Object.keys(val)) {
-      if (typeof val[m] !== 'function') continue;
-      if (/deposit|withdraw|collateral|sub.?account|register|init|create|fund|approve/i.test(m)) {
-        log(`  ✅ client.${ns}.${m}()`);
-      }
-    }
-  }
-  log('');
-
-  // ═══════════════════════════════════════════════
-  // 3. ПРОБУЕМ ВСЕ МЕТОДЫ account/subaccount
-  // ═══════════════════════════════════════════════
-  log('═══ 3. ВЫЗЫВАЕМ ACCOUNT-МЕТОДЫ ═══');
-
-  for (const ns of Object.keys(client)) {
-    if (ns === 'context') continue;
-    const val = client[ns];
-    if (typeof val !== 'object' || val === null) continue;
-
-    // Пробуем все методы в namespace'ах account, subaccount, deposit, vault
-    if (!/account|sub|deposit|vault|user|portfolio|balance|spot|clearinghouse|endpoint/i.test(ns)) continue;
-
-    for (const m of Object.keys(val)) {
-      if (typeof val[m] !== 'function') continue;
-
-      const paramSets = [
-        {},
-        { address: account.address },
-        { sender: account.address },
-        { owner: account.address },
-        account.address,  // иногда просто строка
-      ];
-
-      for (const params of paramSets) {
-        try {
-          const res = await val[m](params);
-          const dump = JSON.stringify(res, (_, v) =>
-            typeof v === 'bigint' ? v.toString() : v
-          ).slice(0, 400);
-          log(`  ✅ ${ns}.${m}(${typeof params === 'string' ? `"${params}"` : JSON.stringify(params)}) →`);
-          log(`     ${dump}`);
-          break;
-        } catch (e) {
-          // тихо пропускаем
-        }
-      }
-      await sleep(500);
-    }
-  }
-  log('');
-
-  // ═══════════════════════════════════════════════
-  // 4. ЧИТАЕМ ENDPOINT КОНТРАКТ НА ЧЕЙНЕ
-  // ═══════════════════════════════════════════════
-  log('═══ 4. ON-CHAIN: ENDPOINT КОНТРАКТ ═══');
-
-  const endpointAddr = '0x05ec92D78ED421f3D3Ada77FFdE167106565974E';
-  const clearinghouseAddr = '0xD218103918C19D0A10cf35300E4CfAfbD444c5fE';
-
-  // Пробуем прочитать quote token (USDC) из endpoint
-  const commonSelectors = [
-    { name: 'getQuote',        sig: 'function getQuote() view returns (address)',           args: [] },
-    { name: 'quote',           sig: 'function quote() view returns (address)',              args: [] },
-    { name: 'quoteToken',      sig: 'function quoteToken() view returns (address)',         args: [] },
-    { name: 'usdc',            sig: 'function usdc() view returns (address)',               args: [] },
-    { name: 'collateralToken', sig: 'function collateralToken() view returns (address)',    args: [] },
-    { name: 'token',           sig: 'function token() view returns (address)',              args: [] },
-    { name: 'getNumSubaccounts',
-      sig: 'function getNumSubaccounts(address owner) view returns (uint64)',
-      args: [account.address] },
-    { name: 'getSubaccountId',
-      sig: 'function getSubaccountId(bytes32 subaccount) view returns (uint64)',
-      args: [`${account.address}${'0'.repeat(24)}`] },  // address + 12 zero bytes
-    { name: 'nSubaccounts',
-      sig: 'function nSubaccounts() view returns (uint64)',
-      args: [] },
-    { name: 'owner',
-      sig: 'function owner() view returns (address)',
-      args: [] },
-  ];
-
-  for (const target of [endpointAddr, clearinghouseAddr]) {
-    const label = target === endpointAddr ? 'Endpoint' : 'Clearinghouse';
-    log(`  ${label} (${target}):`);
-
-    for (const { name, sig, args } of commonSelectors) {
-      try {
-        const res = await publicClient.readContract({
-          address: target,
-          abi: [{ type: 'function', ...parseSig(sig) }],
-          functionName: name,
-          args,
-        });
-        const val = typeof res === 'bigint' ? res.toString() : res;
-        log(`    ✅ ${name}(${args.join(',')}) = ${val}`);
-      } catch (e) {
-        // молча пропускаем
-      }
-    }
-    await sleep(500);
-  }
-  log('');
-
-  // ═══════════════════════════════════════════════
-  // 5. BYTECODE — проверяем депозит-функции контракта
-  // ═══════════════════════════════════════════════
-  log('═══ 5. ПРОВЕРКА DEPOSIT-ФУНКЦИЙ КОНТРАКТА ═══');
-
-  // Селекторы Vertex-like функций
-  const knownSelectors = {
-    'e8e33700': 'depositCollateral(bytes12,uint32,uint128)',
-    'd0e30db0': 'deposit()',
-    'b6b55f25': 'deposit(uint256)',
-    '47e7ef24': 'deposit(address,uint256)',
-    'f340fa01': 'deposit(address)',
-    '6e553f65': 'deposit(uint256,address)',
-    'a0712d68': 'mint(uint256)',
-    '2e1a7d4d': 'withdraw(uint256)',
-    'b460af94': 'withdraw(uint256,address,address)',
-  };
+  await sleep(2000);
 
   try {
-    const code = await publicClient.getBytecode({ address: endpointAddr });
-    if (code) {
-      log(`  Endpoint bytecode: ${code.length} символов`);
-      const codeHex = code.toLowerCase();
-
-      for (const [sel, name] of Object.entries(knownSelectors)) {
-        if (codeHex.includes(sel)) {
-          log(`  ✅ НАЙДЕН: ${name} (0x${sel})`);
-        }
-      }
-    }
-  } catch (e) {
-    log(`  ❌ getBytecode: ${e.message}`);
-  }
-
-  try {
-    const code = await publicClient.getBytecode({ address: clearinghouseAddr });
-    if (code) {
-      log(`  Clearinghouse bytecode: ${code.length} символов`);
-      const codeHex = code.toLowerCase();
-
-      for (const [sel, name] of Object.entries(knownSelectors)) {
-        if (codeHex.includes(sel)) {
-          log(`  ✅ НАЙДЕН в CH: ${name} (0x${sel})`);
-        }
-      }
-    }
-  } catch (e) {
-    log(`  ❌ getBytecode CH: ${e.message}`);
-  }
-  log('');
-
-  // ═══════════════════════════════════════════════
-  // 6. ИЩЕМ USDC НА INK CHAIN
-  // ═══════════════════════════════════════════════
-  log('═══ 6. ПОИСК USDC НА INK ═══');
-
-  const tokenCandidates = [
-    '0xF1815bd50389c46847f0Bda824eC8da914045D14', // USDC.e
-    '0x0200C29006150606B650577BBE7B6248F6995ABD',
-    '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // USDC Base-style
-    '0xd988097fb8612cc24eeC14542bC03424c656005f',
-    '0x7f5c764cBc14f9669B88837ca1490cCa17c31607',
-    '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
-  ];
-
-  const erc20Abi = [
-    { name: 'symbol', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
-    { name: 'decimals', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint8' }] },
-    { name: 'balanceOf', type: 'function', stateMutability: 'view',
-      inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] },
-    { name: 'allowance', type: 'function', stateMutability: 'view',
-      inputs: [{ type: 'address' }, { type: 'address' }], outputs: [{ type: 'uint256' }] },
-  ];
-
-  for (const addr of tokenCandidates) {
-    try {
-      const tok = getContract({ address: addr, abi: erc20Abi, client: publicClient });
-      const [sym, dec, bal] = await Promise.all([
-        tok.read.symbol(),
-        tok.read.decimals(),
-        tok.read.balanceOf([account.address]),
-      ]);
-
-      let allowEndpoint = 0n, allowCH = 0n;
-      try { allowEndpoint = await tok.read.allowance([account.address, endpointAddr]); } catch {}
-      try { allowCH = await tok.read.allowance([account.address, clearinghouseAddr]); } catch {}
-
-      log(`  ${addr}:`);
-      log(`    ${sym} | decimals=${dec} | balance=${formatUnits(bal, dec)}`);
-      log(`    allowance→endpoint=${formatUnits(allowEndpoint, dec)} allowance→CH=${formatUnits(allowCH, dec)}`);
-    } catch {
-      // не ERC20 или не существует
-    }
-  }
-  log('');
-
-  // ═══════════════════════════════════════════════
-  // 7. СМОТРИМ НЕТ ЛИ DEPOSIT ИВЕНТОВ ОТ ЭТОГО АДРЕСА
-  // ═══════════════════════════════════════════════
-  log('═══ 7. ПРОВЕРКА DEPOSIT EVENTS ═══');
-
-  try {
-    // Ищем Transfer events USDC.e -> endpoint (deposit)
-    const usdcAddr = '0xF1815bd50389c46847f0Bda824eC8da914045D14';
-    const logs = await publicClient.getLogs({
-      address: usdcAddr,
-      event: {
-        type: 'event',
-        name: 'Transfer',
-        inputs: [
-          { type: 'address', indexed: true, name: 'from' },
-          { type: 'address', indexed: true, name: 'to' },
-          { type: 'uint256', indexed: false, name: 'value' },
-        ],
-      },
-      args: { from: account.address },
-      fromBlock: 0n,
-      toBlock: 'latest',
+    const { marketPrices } = await nadoClient.market.getLatestMarketPrices({
+      productIds: [1],
     });
 
-    if (logs.length === 0) {
-      log('  ⛔ НЕТ НИ ОДНОГО Transfer USDC.e ОТ ЭТОГО АДРЕСА');
-      log('  → Этот кошелёк НИКОГДА не отправлял USDC.e на Ink chain');
-    } else {
-      log(`  Найдено ${logs.length} Transfer(ов):`);
-      for (const l of logs.slice(0, 10)) {
-        log(`    → to=${l.args.to} amount=${formatUnits(l.args.value, 6)} block=${l.blockNumber}`);
-      }
+    const bid = Number(marketPrices[0]?.bid || 0);
+    const ask = Number(marketPrices[0]?.ask || 0);
+    const mid = (bid + ask) / 2;
+
+    if (mid > 0) {
+      const price = (Math.floor(mid * 0.999 * 100) / 100).toFixed(6);
+      const appendix = String(packOrderAppendix({ orderExecutionType: 'default' }));
+      const exp = String(Math.floor(Date.now() / 1000) + 86400);
+
+      log(`  mid=${mid.toFixed(2)} → тестовый BUY @ ${price}`);
+
+      const res = await nadoClient.market.placeOrder({
+        productId: 1,
+        order: { price, amount: '1', expiration: exp, appendix },
+      });
+      log(`  ✅ ОРДЕР ПРОШЁЛ! ${JSON.stringify(res).slice(0, 200)}`);
+      log('  → Депозит работает, запускаю бота!');
+
+      // Cancel тестовый
+      await sleep(1000);
+      await nadoClient.market.cancelProductOrders({ productIds: [1] }).catch(() => {});
     }
   } catch (e) {
-    log(`  ❌ getLogs: ${(e.message || '').slice(0, 200)}`);
+    const msg = e.message || '';
+    log(`  ❌ Тестовый ордер: ${msg.slice(0, 300)}`);
+
+    if (msg.includes('no previous deposits') || msg.includes('2024')) {
+      log('');
+      log('  ⛔ Всё ещё "no deposits". Возможные причины:');
+      log('  1. Депозит ещё не обработан — подождите 1-2 минуты');
+      log('  2. Нужно депозитить через app.nado.fi вручную');
+      log('  3. Приватный ключ от другого аккаунта MetaMask');
+      log('');
+      log('  Бот подождёт 60 сек и попробует снова...');
+      await sleep(60000);
+    }
   }
+
+  // ═══ 4. МАРКЕТМЕЙКЕР ═══
   log('');
+  log('═══ 4. ЗАПУСК МАРКЕТМЕЙКЕРА ═══');
 
-  log('══════════════════════════════════════════════════');
-  log('  ПОЛНАЯ ДИАГНОСТИКА ЗАВЕРШЕНА');
-  log('  Скопируйте ВЕСЬ лог — он покажет точную причину');
-  log('══════════════════════════════════════════════════');
-}
+  const defaultAppendix = String(packOrderAppendix({ orderExecutionType: 'default' }));
+  const lastBidAsk = new Map();
+  let tickCount = 0, orderOk = 0, orderFail = 0;
+  let currentTickMs = TICK_MS;
 
-// Helper: парсит function signature в ABI-объект
-function parseSig(sig) {
-  const match = sig.match(/function\s+(\w+)\((.*?)\)\s*(?:view\s+)?returns\s*\((.*?)\)/);
-  if (!match) return {};
+  function is429(e) {
+    return (e?.message || '').includes('429') || (e?.message || '').includes('cf_chl');
+  }
 
-  const [, name, inputsStr, outputsStr] = match;
+  function toNum(v) {
+    if (v == null) return 0;
+    if (typeof v === 'bigint') return Number(v);
+    return Number(v);
+  }
 
-  const parseParams = (str) =>
-    str
-      .split(',')
-      .map(s => s.trim())
-      .filter(Boolean)
-      .map(s => {
-        const parts = s.split(/\s+/);
-        return { type: parts[0], name: parts[1] || '' };
+  async function fetchPrices() {
+    try {
+      const { marketPrices } = await nadoClient.market.getLatestMarketPrices({
+        productIds: PRODUCT_IDS,
       });
+      for (const mp of marketPrices) {
+        const bid = toNum(mp.bid);
+        const ask = toNum(mp.ask);
+        if (Number.isFinite(bid) && bid > 0 && Number.isFinite(ask) && ask > 0) {
+          lastBidAsk.set(mp.productId, { bid, ask, mid: (bid + ask) / 2 });
+        }
+      }
+      currentTickMs = TICK_MS;
+      return true;
+    } catch (e) {
+      if (is429(e)) {
+        currentTickMs = Math.min(currentTickMs * 2, MAX_TICK_MS);
+        log(`⚠️ 429 → пауза ${currentTickMs / 1000}с`);
+      } else {
+        log(`❌ fetchPrices: ${(e.message || '').slice(0, 150)}`);
+      }
+      return false;
+    }
+  }
 
-  return {
-    name,
-    stateMutability: sig.includes('view') ? 'view' : 'nonpayable',
-    inputs: parseParams(inputsStr),
-    outputs: parseParams(outputsStr),
-  };
+  async function runTick() {
+    tickCount++;
+    if (!await fetchPrices()) return;
+    await sleep(300);
+
+    const exp = String(Math.floor(Date.now() / 1000) + 86400);
+
+    try {
+      await nadoClient.market.cancelProductOrders({ productIds: PRODUCT_IDS });
+    } catch (e) {
+      if (is429(e)) { currentTickMs = Math.min(currentTickMs * 2, MAX_TICK_MS); return; }
+    }
+
+    for (const productId of PRODUCT_IDS) {
+      const book = lastBidAsk.get(productId);
+      if (!book || book.mid <= 0) continue;
+
+      const buyPrice  = (Math.floor(book.mid * (1 - SPREAD_PCT) * 1e6) / 1e6).toFixed(6);
+      const sellPrice = (Math.ceil(book.mid * (1 + SPREAD_PCT) * 1e6) / 1e6).toFixed(6);
+
+      await sleep(200);
+
+      try {
+        await nadoClient.market.placeOrder({
+          productId,
+          order: { price: buyPrice, amount: ORDER_SIZE, expiration: exp, appendix: defaultAppendix },
+        });
+        orderOk++;
+        if (tickCount <= 5) log(`✅ BUY  pid=${productId} @ ${buyPrice}`);
+      } catch (e) {
+        orderFail++;
+        if (is429(e)) { currentTickMs = Math.min(currentTickMs * 2, MAX_TICK_MS); return; }
+        if (orderFail <= 10) log(`❌ BUY pid=${productId}: ${(e.message || '').slice(0, 150)}`);
+      }
+
+      await sleep(200);
+
+      try {
+        await nadoClient.market.placeOrder({
+          productId,
+          order: { price: sellPrice, amount: String(-Number(ORDER_SIZE)), expiration: exp, appendix: defaultAppendix },
+        });
+        orderOk++;
+        if (tickCount <= 5) log(`✅ SELL pid=${productId} @ ${sellPrice}`);
+      } catch (e) {
+        orderFail++;
+        if (is429(e)) { currentTickMs = Math.min(currentTickMs * 2, MAX_TICK_MS); return; }
+        if (orderFail <= 10) log(`❌ SELL pid=${productId}: ${(e.message || '').slice(0, 150)}`);
+      }
+    }
+  }
+
+  log(`Тик: ${TICK_MS / 1000}с (адаптивный до ${MAX_TICK_MS / 1000}с)`);
+
+  // Основной цикл
+  async function loop() {
+    while (true) {
+      try { await runTick(); } catch (e) { log(`❌ tick: ${e.message?.slice(0, 150)}`); }
+      await sleep(currentTickMs);
+    }
+  }
+
+  setInterval(() => {
+    const mids = Array.from(lastBidAsk.entries())
+      .map(([p, v]) => `pid${p}=${v.mid.toFixed(2)}`)
+      .join(' | ');
+    log(`📊 ${mids || '—'} | tick=${currentTickMs / 1000}s ok=${orderOk} fail=${orderFail}`);
+  }, 60000);
+
+  loop();
 }
 
 main().catch(e => { console.error('FATAL:', e); process.exit(1); });
