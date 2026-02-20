@@ -96,24 +96,36 @@ function runBot() {
         subaccountOwner,
         subaccountName,
       });
-      if (!summary || !summary.balances) return 0;
-      const quoteBal = summary.balances.find((b) => b.productId === QUOTE_PRODUCT_ID);
-      if (!quoteBal) return 0;
-      return toNum(quoteBal.amount);
+  
+      if (!summary || !summary.balances) {
+        log('Summary empty');
+        return 0;
+      }
+  
+      // ←←← DEBUG (покажет структуру один-два раза)
+      if (balanceUsdc === 0) {
+        log('DEBUG full balances: ' + JSON.stringify(summary.balances, null, 2));
+      }
+  
+      const quoteBal = summary.balances.find((b) => Number(b.productId) === QUOTE_PRODUCT_ID);
+      if (!quoteBal) {
+        log('No quote asset in balances');
+        return 0;
+      }
+  
+      // Пробуем все возможные поля (самое частое — available)
+      const bal = toNum(
+        quoteBal.available || 
+        quoteBal.amount || 
+        quoteBal.settled || 
+        quoteBal.total || 0
+      );
+  
+      return bal;
     } catch (err) {
       log(`ERROR getSubaccountSummary: ${err && err.message ? err.message : err}`);
-      scheduleReconnect();
       return 0;
     }
-  }
-
-  function scheduleReconnect() {
-    if (reconnectTimeout) return;
-    log('Reconnect через 5 сек…');
-    reconnectTimeout = setTimeout(() => {
-      reconnectTimeout = null;
-      runTick().catch(() => {});
-    }, 5000);
   }
 
   async function fetchPrices() {
